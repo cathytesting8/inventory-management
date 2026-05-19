@@ -9,27 +9,36 @@
     <div v-else-if="error" class="error">{{ error }}</div>
     <div v-else>
       <div class="stats-grid">
-        <div class="stat-card success">
+        <div :class="['stat-card', 'success', { active: activeStatusFilter === 'Delivered' }]"
+             @click="setStatusFilter('Delivered')">
           <div class="stat-label">{{ t('status.delivered') }}</div>
           <div class="stat-value">{{ getOrdersByStatus('Delivered').length }}</div>
         </div>
-        <div class="stat-card info">
+        <div :class="['stat-card', 'info', { active: activeStatusFilter === 'Shipped' }]"
+             @click="setStatusFilter('Shipped')">
           <div class="stat-label">{{ t('status.shipped') }}</div>
           <div class="stat-value">{{ getOrdersByStatus('Shipped').length }}</div>
         </div>
-        <div class="stat-card warning">
+        <div :class="['stat-card', 'warning', { active: activeStatusFilter === 'Processing' }]"
+             @click="setStatusFilter('Processing')">
           <div class="stat-label">{{ t('status.processing') }}</div>
           <div class="stat-value">{{ getOrdersByStatus('Processing').length }}</div>
         </div>
-        <div class="stat-card danger">
+        <div :class="['stat-card', 'danger', { active: activeStatusFilter === 'Backordered' }]"
+             @click="setStatusFilter('Backordered')">
           <div class="stat-label">{{ t('status.backordered') }}</div>
           <div class="stat-value">{{ getOrdersByStatus('Backordered').length }}</div>
+        </div>
+        <div :class="['stat-card', 'restocking-stat', { active: activeStatusFilter === 'Restocking' }]"
+             @click="setStatusFilter('Restocking')">
+          <div class="stat-label">Restocking</div>
+          <div class="stat-value">{{ getOrdersByType('Restocking').length }}</div>
         </div>
       </div>
 
       <div class="card">
         <div class="card-header">
-          <h3 class="card-title">{{ t('orders.allOrders') }} ({{ orders.length }})</h3>
+          <h3 class="card-title">{{ t('orders.allOrders') }} ({{ displayedOrders.length }})</h3>
         </div>
         <div class="table-container">
           <table class="orders-table">
@@ -44,31 +53,31 @@
                 <th class="col-value">{{ t('orders.table.totalValue') }}</th>
               </tr>
             </thead>
-            <tbody>
-              <tr v-for="order in orders" :key="order.id">
+            <tbody :key="activeStatusFilter">
+              <tr v-for="order in displayedOrders" :key="order.id">
                 <td class="col-order-number"><strong>{{ order.order_number }}</strong></td>
-                <td class="col-customer">{{ translateCustomerName(order.customer) }}</td>
+                <td class="col-customer">{{ translateCustomerName(order.customer || 'Internal') }}</td>
                 <td class="col-items">
                   <details class="items-details">
                     <summary class="items-summary">
-                      {{ t('orders.itemsCount', { count: order.items.length }) }}
+                      {{ t('orders.itemsCount', { count: (order.items || []).length }) }}
                     </summary>
                     <div class="items-dropdown">
-                      <div v-for="(item, idx) in order.items" :key="idx" class="item-entry">
+                      <div v-for="item in (order.items || [])" :key="item.sku || item.name" class="item-entry">
                         <span class="item-name">{{ translateProductName(item.name) }}</span>
-                        <span class="item-meta">{{ t('orders.quantity') }}: {{ item.quantity }} @ {{ currencySymbol }}{{ item.unit_price }}</span>
+                        <span class="item-meta">{{ t('orders.quantity') }}: {{ item.quantity }} @ {{ currencySymbol }}{{ item.unit_price ?? item.unit_cost ?? '' }}</span>
                       </div>
                     </div>
                   </details>
                 </td>
                 <td class="col-status">
                   <span :class="['badge', getOrderStatusClass(order.status)]">
-                    {{ t(`status.${order.status.toLowerCase()}`) }}
+                    {{ order.status === 'Restocking' ? 'Restocking' : t(`status.${order.status.toLowerCase()}`) }}
                   </span>
                 </td>
                 <td class="col-date">{{ formatDate(order.order_date) }}</td>
                 <td class="col-date">{{ formatDate(order.expected_delivery) }}</td>
-                <td class="col-value"><strong>{{ currencySymbol }}{{ order.total_value.toLocaleString() }}</strong></td>
+                <td class="col-value"><strong>{{ currencySymbol }}{{ (order.total_value || 0).toLocaleString() }}</strong></td>
               </tr>
             </tbody>
           </table>
@@ -95,6 +104,31 @@ export default {
     const loading = ref(true)
     const error = ref(null)
     const orders = ref([])
+    const activeStatusFilter = ref(null)
+
+    const displayedOrders = computed(() => {
+      let result = orders.value
+
+      if (activeStatusFilter.value) {
+        // Stat card click takes priority over the FilterBar status dropdown
+        if (activeStatusFilter.value === 'Restocking') {
+          return result.filter(o => o.type === 'Restocking')
+        }
+        return result.filter(o => o.status === activeStatusFilter.value)
+      }
+
+      // No stat card active: apply the global FilterBar status as a local filter
+      if (selectedStatus.value && selectedStatus.value !== 'all') {
+        return result.filter(o => o.status.toLowerCase() === selectedStatus.value)
+      }
+
+      return result
+    })
+
+    // Toggle: clicking the already-active card clears the filter
+    const setStatusFilter = (status) => {
+      activeStatusFilter.value = activeStatusFilter.value === status ? null : status
+    }
 
     // Use shared filters
     const {
@@ -109,12 +143,24 @@ export default {
       try {
         loading.value = true
         const filters = getCurrentFilters()
-        const fetchedOrders = await api.getOrders(filters)
 
-        // Sort orders by order_date (earliest first)
-        orders.value = fetchedOrders.sort((a, b) => {
+        // Omit status from the API call — status is filtered locally in displayedOrders
+        // so stat card clicks and the FilterBar dropdown don't conflict with each other
+        const { status: _ignored, ...filtersWithoutStatus } = filters
+
+        // Fetch regular orders and restocking orders concurrently
+        const [fetchedOrders, restockingOrders] = await Promise.all([
+          api.getOrders(filtersWithoutStatus),
+          api.getRestockingOrders()
+        ])
+
+        // Merge and sort by order_date (earliest first), guarding against invalid dates
+        const combined = [...fetchedOrders, ...restockingOrders]
+        orders.value = combined.sort((a, b) => {
           const dateA = new Date(a.order_date)
           const dateB = new Date(b.order_date)
+          if (isNaN(dateA.getTime())) return 1
+          if (isNaN(dateB.getTime())) return -1
           return dateA - dateB
         })
       } catch (err) {
@@ -133,20 +179,29 @@ export default {
       return orders.value.filter(order => order.status === status)
     }
 
+    // Count orders by type field (used for restocking stat card)
+    const getOrdersByType = (type) => {
+      return orders.value.filter(order => order.type === type)
+    }
+
     const getOrderStatusClass = (status) => {
       const statusMap = {
         'Delivered': 'success',
         'Shipped': 'info',
         'Processing': 'warning',
-        'Backordered': 'danger'
+        'Backordered': 'danger',
+        'Restocking': 'restocking'
       }
       return statusMap[status] || 'info'
     }
 
     const formatDate = (dateString) => {
+      if (!dateString) return '—'
       const { currentLocale } = useI18n()
       const locale = currentLocale.value === 'ja' ? 'ja-JP' : 'en-US'
-      return new Date(dateString).toLocaleDateString(locale, {
+      const d = new Date(dateString)
+      if (isNaN(d.getTime())) return '—'
+      return d.toLocaleDateString(locale, {
         year: 'numeric',
         month: 'short',
         day: 'numeric'
@@ -161,11 +216,15 @@ export default {
       error,
       orders,
       getOrdersByStatus,
+      getOrdersByType,
       getOrderStatusClass,
       formatDate,
       currencySymbol,
       translateProductName,
-      translateCustomerName
+      translateCustomerName,
+      activeStatusFilter,
+      displayedOrders,
+      setStatusFilter
     }
   }
 }
@@ -275,5 +334,47 @@ export default {
 .item-meta {
   font-size: 0.813rem;
   color: #64748b;
+}
+
+/* Restocking badge */
+.badge.restocking {
+  background: #ede9fe;
+  color: #5b21b6;
+}
+
+/* Restocking stat card */
+.stat-card.restocking-stat .stat-value {
+  color: #5b21b6;
+}
+
+/* Clickable stat cards */
+.stat-card {
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.stat-card.success.active {
+  border-color: #059669;
+  box-shadow: 0 0 0 3px rgba(5, 150, 105, 0.12);
+}
+
+.stat-card.info.active {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.stat-card.warning.active {
+  border-color: #ea580c;
+  box-shadow: 0 0 0 3px rgba(234, 88, 12, 0.12);
+}
+
+.stat-card.danger.active {
+  border-color: #dc2626;
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.12);
+}
+
+.stat-card.restocking-stat.active {
+  border-color: #5b21b6;
+  box-shadow: 0 0 0 3px rgba(91, 33, 182, 0.12);
 }
 </style>
