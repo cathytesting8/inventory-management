@@ -2,7 +2,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import date, timedelta
+import uuid
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
+
+# In-memory stores for data created during this session
+restocking_orders: list = []
+tasks_store: list = []
 
 app = FastAPI(title="Factory Inventory Management System")
 
@@ -303,6 +309,208 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+# ── Restocking models ──────────────────────────────────────────────────────────
+
+class RestockingRecommendation(BaseModel):
+    sku: str
+    name: str
+    category: str
+    warehouse: str
+    quantity_on_hand: int
+    reorder_point: int
+    unit_cost: float
+    quantity_to_order: int
+    line_total: float
+    score: float
+    trend: Optional[str] = None
+
+class RestockingOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float
+    line_total: float
+
+class SubmitRestockingOrderRequest(BaseModel):
+    items: List[RestockingOrderItem]
+    total_value: float
+    expected_delivery: str  # ISO date string
+
+class RestockingOrder(BaseModel):
+    id: str
+    order_number: str
+    type: str
+    customer: str
+    items: List[dict]
+    status: str
+    order_date: str
+    expected_delivery: str
+    total_value: float
+    warehouse: Optional[str] = None
+    category: Optional[str] = None
+
+# ── Restocking endpoints ───────────────────────────────────────────────────────
+
+@app.get("/api/restocking/recommendations", response_model=List[RestockingRecommendation])
+def get_restocking_recommendations(budget: Optional[float] = None):
+    """
+    Score and rank inventory items for restocking.
+    Scoring combines stock urgency (how far below reorder point) and
+    demand trend (increasing > stable > decreasing) with equal weight.
+    """
+    # Build a SKU → demand forecast lookup for O(1) access
+    demand_by_sku = {d["item_sku"]: d for d in demand_forecasts}
+
+    trend_score_map = {"increasing": 1.0, "stable": 0.5, "decreasing": 0.0}
+
+    recommendations = []
+    for item in inventory_items:
+        qty = item["quantity_on_hand"]
+        reorder = item["reorder_point"]
+
+        # Stock urgency: 0-1 (1 = at or below reorder point, 0 = well stocked)
+        stock_score = max(0.0, (reorder - qty) / reorder) if reorder > 0 else 0.0
+
+        # Demand trend: default to stable (0.5) if no forecast data for this SKU
+        demand = demand_by_sku.get(item["sku"])
+        trend = demand["trend"] if demand else "stable"
+        demand_score = trend_score_map.get(trend, 0.5)
+
+        combined_score = round(0.5 * stock_score + 0.5 * demand_score, 4)
+
+        # Order enough to reach 2× reorder point; minimum = reorder_point itself
+        qty_to_order = max(2 * reorder - qty, reorder)
+        line_total = round(qty_to_order * item["unit_cost"], 2)
+
+        recommendations.append({
+            "sku": item["sku"],
+            "name": item["name"],
+            "category": item["category"],
+            "warehouse": item["warehouse"],
+            "quantity_on_hand": qty,
+            "reorder_point": reorder,
+            "unit_cost": item["unit_cost"],
+            "quantity_to_order": qty_to_order,
+            "line_total": line_total,
+            "score": combined_score,
+            "trend": trend,
+        })
+
+    # Sort highest-urgency first
+    recommendations.sort(key=lambda x: x["score"], reverse=True)
+
+    return recommendations
+
+
+@app.post("/api/restocking/orders", response_model=RestockingOrder)
+def submit_restocking_order(request: SubmitRestockingOrderRequest):
+    """Submit a restocking order; stored in memory for this session."""
+    today = date.today().isoformat()
+    order_number = f"RST-{len(restocking_orders) + 1:04d}"
+
+    new_order = {
+        "id": str(uuid.uuid4()),
+        "order_number": order_number,
+        "type": "Restocking",
+        "customer": "Internal Restock",
+        "items": [item.model_dump() for item in request.items],
+        "status": "Restocking",
+        "order_date": today,
+        "expected_delivery": request.expected_delivery,
+        "total_value": request.total_value,
+        "warehouse": None,
+        "category": None,
+    }
+
+    restocking_orders.append(new_order)
+    return new_order
+
+
+@app.get("/api/restocking/orders", response_model=List[RestockingOrder])
+def get_restocking_orders():
+    """Return all restocking orders submitted in this session."""
+    return restocking_orders
+
+
+# ── Tasks models ───────────────────────────────────────────────────────────────
+
+class Task(BaseModel):
+    id: str
+    title: str
+    priority: str
+    status: str
+    due_date: str
+    created_date: str
+    notes: Optional[str] = None
+
+class CreateTaskRequest(BaseModel):
+    title: str
+    priority: str
+    due_date: str
+    notes: Optional[str] = None
+
+# ── Tasks endpoints ────────────────────────────────────────────────────────────
+
+@app.get("/api/tasks", response_model=List[Task])
+def get_tasks():
+    return tasks_store
+
+@app.post("/api/tasks", response_model=Task, status_code=201)
+def create_task(request: CreateTaskRequest):
+    new_task = {
+        "id": str(uuid.uuid4()),
+        "title": request.title,
+        "priority": request.priority,
+        "status": "pending",
+        "due_date": request.due_date,
+        "created_date": date.today().isoformat(),
+        "notes": request.notes,
+    }
+    tasks_store.append(new_task)
+    return new_task
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: str):
+    task = next((t for t in tasks_store if t["id"] == task_id), None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    tasks_store.remove(task)
+    return {"deleted": task_id}
+
+@app.patch("/api/tasks/{task_id}", response_model=Task)
+def toggle_task(task_id: str):
+    task = next((t for t in tasks_store if t["id"] == task_id), None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task["status"] = "completed" if task["status"] == "pending" else "pending"
+    return task
+
+# ── Purchase order endpoints ───────────────────────────────────────────────────
+
+@app.post("/api/purchase-orders", response_model=PurchaseOrder, status_code=201)
+def create_purchase_order(request: CreatePurchaseOrderRequest):
+    new_po = {
+        "id": str(uuid.uuid4()),
+        "backlog_item_id": request.backlog_item_id,
+        "supplier_name": request.supplier_name,
+        "quantity": request.quantity,
+        "unit_cost": request.unit_cost,
+        "expected_delivery_date": request.expected_delivery_date,
+        "status": "Pending",
+        "created_date": date.today().isoformat(),
+        "notes": request.notes,
+    }
+    purchase_orders.append(new_po)
+    return new_po
+
+@app.get("/api/purchase-orders/{backlog_item_id}", response_model=PurchaseOrder)
+def get_purchase_order(backlog_item_id: str):
+    po = next((p for p in purchase_orders if p["backlog_item_id"] == backlog_item_id), None)
+    if not po:
+        raise HTTPException(status_code=404, detail="Purchase order not found")
+    return po
+
 
 if __name__ == "__main__":
     import uvicorn
